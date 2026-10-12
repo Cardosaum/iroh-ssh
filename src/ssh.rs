@@ -7,7 +7,7 @@ use homedir::my_home;
 use regex::Regex;
 
 use iroh::{
-    Endpoint, EndpointId, RelayUrl, SecretKey,
+    Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey,
     endpoint::{Connection, RelayMode},
     protocol::{ProtocolHandler, Router},
 };
@@ -117,6 +117,7 @@ impl Builder {
             secret_key: self.secret_key,
             inner: None,
             ssh_port: self.accept_port.unwrap_or(22),
+            relay_urls: urls.clone(),
         };
 
         let router = if self.accept_incoming {
@@ -206,10 +207,11 @@ impl IrohSsh {
 
     pub async fn connect_pubkey(&self, endpoint_id: EndpointId) -> anyhow::Result<()> {
         let inner = self.inner.as_ref().expect("inner not set");
-        let conn = inner
-            .endpoint
-            .connect(endpoint_id, &IrohSsh::ALPN())
-            .await?;
+        let mut addr = EndpointAddr::new(endpoint_id);
+        for url in &self.relay_urls {
+            addr = addr.with_relay_url(url.clone());
+        }
+        let conn = inner.endpoint.connect(addr, &IrohSsh::ALPN()).await?;
         let (mut iroh_send, mut iroh_recv) = conn.open_bi().await?;
         let (mut local_read, mut local_write) = (tokio::io::stdin(), tokio::io::stdout());
         let a_to_b = async move {
