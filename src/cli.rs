@@ -3,8 +3,10 @@ use std::{ffi::OsString, path::PathBuf};
 use clap::{ArgAction, Args, Parser, Subcommand};
 
 const TARGET_HELP: &str = "Target in the form user@ENDPOINT_ID";
-const RELAY_URL_HELP: &str = "Use only these relay servers, replacing the defaults (repeatable)";
-const EXTRA_RELAY_URL_HELP: &str = "Add relay servers alongside the defaults (repeatable)";
+const RELAY_URL_HELP: &str =
+    "Use only these relay servers (repeatable). When omitted, relays are disabled";
+const EXTRA_RELAY_URL_HELP: &str =
+    "Relay servers to use when --relay-url is omitted (repeatable)";
 const KEY_DIR_HELP: &str = "Directory for iroh-ssh identity keys (default: ~/.ssh)";
 
 #[derive(Parser, Debug)]

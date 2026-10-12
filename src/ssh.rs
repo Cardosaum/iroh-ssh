@@ -4,12 +4,10 @@ use std::{ffi::OsString, io, path::Path, process::Stdio, time::Duration};
 use anyhow::bail;
 use ed25519_dalek::SECRET_KEY_LENGTH;
 use homedir::my_home;
-use iroh_mainline_address_lookup::DhtAddressLookup;
 use regex::Regex;
-use std::sync::Arc;
 
 use iroh::{
-    Endpoint, EndpointId, RelayConfig, RelayUrl, SecretKey,
+    Endpoint, EndpointId, RelayUrl, SecretKey,
     endpoint::{Connection, RelayMode},
     protocol::{ProtocolHandler, Router},
 };
@@ -96,21 +94,21 @@ impl Builder {
         let mdns_lookup = iroh_mdns_peer_lookup::Options::new()
             .announce(self.accept_incoming)
             .build();
-        let mut builder = Endpoint::builder(iroh::endpoint::presets::N0)
+        let mut builder = Endpoint::builder(iroh::endpoint::presets::Minimal)
             .secret_key(secret_key)
-            .address_lookup(DhtAddressLookup::builder())
             .address_lookup(iroh_mdns_peer_lookup::lookup(mdns_lookup).await?);
 
-        if !self.relay_urls.is_empty() {
-            let relay_map = self.relay_urls.iter().cloned().collect();
-            builder = builder.relay_mode(RelayMode::Custom(relay_map));
-        } else if !self.extra_relay_urls.is_empty() {
-            let relay_map = RelayMode::Default.relay_map();
-            for url in &self.extra_relay_urls {
-                relay_map.insert(url.clone(), Arc::new(RelayConfig::from(url.clone())));
-            }
-            builder = builder.relay_mode(RelayMode::Custom(relay_map));
-        }
+        let urls = if !self.relay_urls.is_empty() {
+            &self.relay_urls
+        } else {
+            &self.extra_relay_urls
+        };
+        let relay_mode = if urls.is_empty() {
+            RelayMode::Disabled
+        } else {
+            RelayMode::Custom(urls.iter().cloned().collect())
+        };
+        builder = builder.relay_mode(relay_mode);
 
         let endpoint = builder.bind().await?;
 

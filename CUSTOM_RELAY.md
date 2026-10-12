@@ -4,7 +4,7 @@ This version of `iroh-ssh` is built on iroh version `1.0.0`. This is tested to b
 
 ## Usage --relay-url
 
-To connect an `iroh-ssh` client to a server using the `--relay-url <URL>` option, the `iroh-ssh server` must also use the same `--relay-url <URL>` to guarantee connection.
+To connect an `iroh-ssh` client to a server using the `--relay-url <URL>` option, the `iroh-ssh server` must also use the same `--relay-url <URL>` to guarantee connection. With no URL, relays stay off.
 
 ```bash
 > iroh-ssh server --relay-url <URL>
