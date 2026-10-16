@@ -2,12 +2,14 @@ mod cli;
 mod service;
 mod ssh;
 
-use std::path::PathBuf;
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use ed25519_dalek::{PUBLIC_KEY_LENGTH, SECRET_KEY_LENGTH};
-use iroh::{Endpoint, RelayUrl, protocol::Router};
-
-use ssh::Peers;
+use iroh::{Endpoint, EndpointId, RelayUrl, endpoint::Connection, protocol::Router};
 
 pub mod api;
 
@@ -26,8 +28,8 @@ pub struct IrohSsh {
     pub(crate) inner: Option<Inner>,
     pub(crate) ssh_port: u16,
     pub(crate) relay_urls: Vec<RelayUrl>,
-    /// Connections kept open so iroh does not drop the selected path.
-    pub(crate) peers: Peers,
+    /// Open connections. iroh forgets the direct path when the last one closes.
+    pub(crate) peers: Arc<Mutex<HashMap<EndpointId, Connection>>>,
 }
 
 #[derive(Debug, Clone)]

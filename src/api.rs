@@ -1,9 +1,6 @@
 use std::{path::PathBuf, process::ExitStatus, str::FromStr as _};
 
 use anyhow::bail;
-use homedir::my_home;
-#[cfg(not(unix))]
-use iroh::EndpointId;
 use iroh::{RelayUrl, SecretKey};
 
 use crate::{
@@ -121,14 +118,7 @@ pub async fn server_mode(server_args: ServerArgs, service: bool) -> anyhow::Resu
         iroh_ssh.endpoint_id()
     );
     if server_args.persist {
-        let ssh_dir = match server_args.key_dir.as_deref() {
-            Some(dir) => dir.to_path_buf(),
-            None => {
-                let distro_home =
-                    my_home()?.ok_or_else(|| anyhow::anyhow!("home directory not found"))?;
-                distro_home.join(".ssh")
-            }
-        };
+        let ssh_dir = crate::ssh::ssh_dir(server_args.key_dir.as_deref())?;
         println!("  (using persistent keys in {})", ssh_dir.display());
     } else {
         println!(
@@ -167,23 +157,42 @@ pub async fn proxy_mode(proxy_args: ProxyArgs) -> anyhow::Result<()> {
     if hostname.len() == 64 && hostname.chars().all(|c| c.is_ascii_hexdigit()) {
         #[cfg(unix)]
         {
-            proxy_through_server(&proxy_args, hostname).await
+            return proxy_through_server(proxy_args.key_dir.as_deref(), hostname).await;
         }
         #[cfg(not(unix))]
         {
-            proxy_direct(&proxy_args, hostname).await
+            bail!("iroh-ssh proxy requires the unix server socket");
         }
-    } else {
-        let iroh_ssh = IrohSsh::builder().build().await?;
-        iroh_ssh.connect_tcpip(&proxy_args.endpoint_id).await
     }
+    copy_tcp(&proxy_args.endpoint_id).await
+}
+
+async fn copy_tcp(host_addr: &str) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let conn = tokio::net::TcpStream::connect(host_addr).await?;
+    let (mut tcp_read, mut tcp_write) = conn.into_split();
+    let (mut local_read, mut local_write) = (tokio::io::stdin(), tokio::io::stdout());
+    let a_to_b = async move {
+        let res = tokio::io::copy(&mut local_read, &mut tcp_write).await;
+        tcp_write.shutdown().await.ok();
+        res
+    };
+    let b_to_a = async move { tokio::io::copy(&mut tcp_read, &mut local_write).await };
+    let (a_to_b, b_to_a) = tokio::join!(a_to_b, b_to_a);
+    a_to_b?;
+    b_to_a?;
+    Ok(())
 }
 
 #[cfg(unix)]
-async fn proxy_through_server(proxy_args: &ProxyArgs, hostname: &str) -> anyhow::Result<()> {
+async fn proxy_through_server(
+    key_dir: Option<&std::path::Path>,
+    hostname: &str,
+) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
 
-    let sock = crate::ssh::proxy_socket_path(proxy_args.key_dir.as_deref())?;
+    let sock = crate::ssh::proxy_socket_path(key_dir)?;
     let mut stream = tokio::net::UnixStream::connect(&sock)
         .await
         .map_err(|err| {
@@ -201,26 +210,6 @@ async fn proxy_through_server(proxy_args: &ProxyArgs, hostname: &str) -> anyhow:
     to_server?;
     from_server?;
     Ok(())
-}
-
-#[cfg(not(unix))]
-async fn proxy_direct(proxy_args: &ProxyArgs, hostname: &str) -> anyhow::Result<()> {
-    let key_dir = match &proxy_args.key_dir {
-        Some(dir) => dir.clone(),
-        None => my_home()?
-            .ok_or_else(|| anyhow::anyhow!("home directory not found"))?
-            .join(".ssh")
-            .join("iroh-client"),
-    };
-    let mut builder = IrohSsh::builder()
-        .accept_incoming(false)
-        .key_dir(Some(key_dir))
-        .relay_urls(parse_relay_urls(&proxy_args.relay_url)?)
-        .extra_relay_urls(parse_relay_urls(&proxy_args.extra_relay_url)?);
-    builder = builder.dot_ssh_integration(true, false);
-    let iroh_ssh = builder.build().await?;
-    let endpoint_id = EndpointId::from_str(hostname)?;
-    iroh_ssh.connect_pubkey(endpoint_id).await
 }
 
 pub async fn client_mode(connect_args: ConnectArgs) -> anyhow::Result<()> {
