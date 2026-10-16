@@ -2,7 +2,9 @@ use std::{path::PathBuf, process::ExitStatus, str::FromStr as _};
 
 use anyhow::bail;
 use homedir::my_home;
-use iroh::{EndpointId, RelayUrl, SecretKey};
+#[cfg(not(unix))]
+use iroh::EndpointId;
+use iroh::{RelayUrl, SecretKey};
 
 use crate::{
     IrohSsh,
@@ -17,20 +19,8 @@ fn parse_relay_urls(urls: &[String]) -> anyhow::Result<Vec<RelayUrl>> {
 }
 
 pub async fn info_mode(key_dir: Option<PathBuf>) -> anyhow::Result<()> {
-    let server_key = dot_ssh(
-        &SecretKey::generate(),
-        false,
-        false,
-        key_dir.as_deref(),
-    )
-    .ok();
-    let service_key = dot_ssh(
-        &SecretKey::generate(),
-        false,
-        true,
-        key_dir.as_deref(),
-    )
-    .ok();
+    let server_key = dot_ssh(&SecretKey::generate(), false, false, key_dir.as_deref()).ok();
+    let service_key = dot_ssh(&SecretKey::generate(), false, true, key_dir.as_deref()).ok();
 
     if server_key.is_none() && service_key.is_none() {
         println!(
@@ -131,8 +121,8 @@ pub async fn server_mode(server_args: ServerArgs, service: bool) -> anyhow::Resu
         iroh_ssh.endpoint_id()
     );
     if server_args.persist {
-        let ssh_dir = match server_args.key_dir {
-            Some(dir) => dir,
+        let ssh_dir = match server_args.key_dir.as_deref() {
+            Some(dir) => dir.to_path_buf(),
             None => {
                 let distro_home =
                     my_home()?.ok_or_else(|| anyhow::anyhow!("home directory not found"))?;
@@ -153,47 +143,95 @@ pub async fn server_mode(server_args: ServerArgs, service: bool) -> anyhow::Resu
 
     println!("Waiting for incoming connections...");
     println!("Press Ctrl+C to exit");
+    #[cfg(unix)]
+    {
+        let sock = iroh_ssh.spawn_proxy_listener(server_args.key_dir.as_deref())?;
+        println!("  proxy socket {}", sock.display());
+    }
     tokio::signal::ctrl_c().await?;
+    #[cfg(unix)]
+    {
+        if let Ok(sock) = crate::ssh::proxy_socket_path(server_args.key_dir.as_deref()) {
+            let _ = std::fs::remove_file(sock);
+        }
+    }
     Ok(())
 }
 
 pub async fn proxy_mode(proxy_args: ProxyArgs) -> anyhow::Result<()> {
-    let iroh_ssh = IrohSsh::builder()
-        .accept_incoming(false)
-        .relay_urls(parse_relay_urls(&proxy_args.relay_url)?)
-        .extra_relay_urls(parse_relay_urls(&proxy_args.extra_relay_url)?)
-        .build()
-        .await?;
     let hostname = proxy_args
         .endpoint_id
         .split(":")
         .next()
         .ok_or_else(|| anyhow::anyhow!("failed to parse hostname"))?;
     if hostname.len() == 64 && hostname.chars().all(|c| c.is_ascii_hexdigit()) {
-        let endpoint_id = EndpointId::from_str(hostname)?;
-        iroh_ssh.connect_pubkey(endpoint_id).await
+        #[cfg(unix)]
+        {
+            proxy_through_server(&proxy_args, hostname).await
+        }
+        #[cfg(not(unix))]
+        {
+            proxy_direct(&proxy_args, hostname).await
+        }
     } else {
-        // fallback to dns base (or ip) HostName connection (no iroh)
+        let iroh_ssh = IrohSsh::builder().build().await?;
         iroh_ssh.connect_tcpip(&proxy_args.endpoint_id).await
     }
 }
 
-pub async fn client_mode(connect_args: ConnectArgs) -> anyhow::Result<()> {
-    let iroh_ssh = IrohSsh::builder()
-        .accept_incoming(false)
-        .relay_urls(parse_relay_urls(&connect_args.relay_url)?)
-        .extra_relay_urls(parse_relay_urls(&connect_args.extra_relay_url)?)
-        .build()
-        .await?;
-    let mut ssh_process = match iroh_ssh
-        .start_ssh(
-            connect_args.target,
-            connect_args.ssh,
-            connect_args.remote_cmd,
-            &connect_args.relay_url,
-            &connect_args.extra_relay_url,
-        )
+#[cfg(unix)]
+async fn proxy_through_server(proxy_args: &ProxyArgs, hostname: &str) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let sock = crate::ssh::proxy_socket_path(proxy_args.key_dir.as_deref())?;
+    let mut stream = tokio::net::UnixStream::connect(&sock)
         .await
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "iroh-ssh server is not listening on {}: {err}",
+                sock.display()
+            )
+        })?;
+    stream.write_all(format!("{hostname}\n").as_bytes()).await?;
+    let (mut read, mut write) = stream.into_split();
+    let (mut stdin, mut stdout) = (tokio::io::stdin(), tokio::io::stdout());
+    let to_server = async move { tokio::io::copy(&mut stdin, &mut write).await };
+    let from_server = async move { tokio::io::copy(&mut read, &mut stdout).await };
+    let (to_server, from_server) = tokio::join!(to_server, from_server);
+    to_server?;
+    from_server?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn proxy_direct(proxy_args: &ProxyArgs, hostname: &str) -> anyhow::Result<()> {
+    let key_dir = match &proxy_args.key_dir {
+        Some(dir) => dir.clone(),
+        None => my_home()?
+            .ok_or_else(|| anyhow::anyhow!("home directory not found"))?
+            .join(".ssh")
+            .join("iroh-client"),
+    };
+    let mut builder = IrohSsh::builder()
+        .accept_incoming(false)
+        .key_dir(Some(key_dir))
+        .relay_urls(parse_relay_urls(&proxy_args.relay_url)?)
+        .extra_relay_urls(parse_relay_urls(&proxy_args.extra_relay_url)?);
+    builder = builder.dot_ssh_integration(true, false);
+    let iroh_ssh = builder.build().await?;
+    let endpoint_id = EndpointId::from_str(hostname)?;
+    iroh_ssh.connect_pubkey(endpoint_id).await
+}
+
+pub async fn client_mode(connect_args: ConnectArgs) -> anyhow::Result<()> {
+    let mut ssh_process = match crate::ssh::spawn_ssh(
+        connect_args.target,
+        connect_args.ssh,
+        connect_args.remote_cmd,
+        &connect_args.relay_url,
+        &connect_args.extra_relay_url,
+    )
+    .await
     {
         Ok(child) => child,
         Err(err) => match err.kind() {

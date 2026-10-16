@@ -5,8 +5,7 @@ use clap::{ArgAction, Args, Parser, Subcommand};
 const TARGET_HELP: &str = "Target in the form user@ENDPOINT_ID";
 const RELAY_URL_HELP: &str =
     "Use only these relay servers (repeatable). When omitted, relays are disabled";
-const EXTRA_RELAY_URL_HELP: &str =
-    "Relay servers to use when --relay-url is omitted (repeatable)";
+const EXTRA_RELAY_URL_HELP: &str = "Relay servers to use when --relay-url is omitted (repeatable)";
 const KEY_DIR_HELP: &str = "Directory for iroh-ssh identity keys (default: ~/.ssh)";
 
 #[derive(Parser, Debug)]
@@ -59,6 +58,10 @@ pub struct ProxyArgs {
 
     #[arg(long, value_name = "URL", help = EXTRA_RELAY_URL_HELP, action = ArgAction::Append)]
     pub extra_relay_url: Vec<String>,
+
+    /// Directory of the running server's proxy socket. Default is ~/.ssh.
+    #[arg(long, value_name = "DIR", help = KEY_DIR_HELP)]
+    pub key_dir: Option<PathBuf>,
 }
 
 #[derive(Args, Clone, Debug)]

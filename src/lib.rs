@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use ed25519_dalek::{PUBLIC_KEY_LENGTH, SECRET_KEY_LENGTH};
 use iroh::{Endpoint, RelayUrl, protocol::Router};
 
+use ssh::Peers;
+
 pub mod api;
 
 pub use cli::*;
@@ -24,6 +26,8 @@ pub struct IrohSsh {
     pub(crate) inner: Option<Inner>,
     pub(crate) ssh_port: u16,
     pub(crate) relay_urls: Vec<RelayUrl>,
+    /// Connections kept open so iroh does not drop the selected path.
+    pub(crate) peers: Peers,
 }
 
 #[derive(Debug, Clone)]

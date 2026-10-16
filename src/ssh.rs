@@ -1,10 +1,19 @@
 use crate::{Builder, Inner, IrohSsh, cli::SshOpts};
-use std::{ffi::OsString, io, path::Path, process::Stdio, time::Duration};
+use std::{
+    collections::HashMap,
+    ffi::OsString,
+    io,
+    path::Path,
+    process::Stdio,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::bail;
 use ed25519_dalek::SECRET_KEY_LENGTH;
 use homedir::my_home;
 use regex::Regex;
+use std::str::FromStr;
 
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey,
@@ -12,10 +21,17 @@ use iroh::{
     protocol::{ProtocolHandler, Router},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
     process::{Child, Command},
 };
+
+/// Live connections, shared by the accept loop and the proxy listener.
+pub(crate) type Peers = Arc<Mutex<HashMap<EndpointId, Connection>>>;
+
+pub(crate) fn new_peers() -> Peers {
+    Arc::new(Mutex::new(HashMap::new()))
+}
 
 impl Builder {
     pub fn new() -> Self {
@@ -118,6 +134,7 @@ impl Builder {
             inner: None,
             ssh_port: self.accept_port.unwrap_or(22),
             relay_urls: urls.clone(),
+            peers: new_peers(),
         };
 
         let router = if self.accept_incoming {
@@ -186,23 +203,7 @@ impl IrohSsh {
         relay_urls: &[String],
         extra_relay_urls: &[String],
     ) -> io::Result<Child> {
-        let c_exe = std::env::current_exe()?;
-        let mut cmd = build_ssh_command(
-            &c_exe,
-            target,
-            ssh_opts,
-            remote_cmd,
-            relay_urls,
-            extra_relay_urls,
-        );
-
-        let ssh_process = cmd
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()?;
-
-        Ok(ssh_process)
+        spawn_ssh(target, ssh_opts, remote_cmd, relay_urls, extra_relay_urls).await
     }
 
     pub async fn connect_pubkey(&self, endpoint_id: EndpointId) -> anyhow::Result<()> {
@@ -243,6 +244,234 @@ impl IrohSsh {
     pub fn endpoint_id(&self) -> EndpointId {
         self.inner.as_ref().expect("inner not set").endpoint.id()
     }
+
+    fn allowed(&self, endpoint_id: &EndpointId) -> bool {
+        let Ok(allow) = std::env::var("IROH_SSH_ALLOW") else {
+            return true;
+        };
+        allow
+            .split(',')
+            .any(|id| id.trim() == endpoint_id.to_string())
+    }
+
+    fn live(&self, endpoint_id: EndpointId) -> Option<Connection> {
+        let peers = self.peers.lock().expect("peers");
+        let conn = peers.get(&endpoint_id)?.clone();
+        if conn.close_reason().is_some() {
+            None
+        } else {
+            Some(conn)
+        }
+    }
+
+    fn retire(&self, endpoint_id: EndpointId) {
+        let mut peers = self.peers.lock().expect("peers");
+        let dead = peers
+            .get(&endpoint_id)
+            .and_then(|conn| conn.close_reason())
+            .is_some();
+        if dead {
+            peers.remove(&endpoint_id);
+        }
+    }
+
+    /// Remember an outbound connection and accept streams the peer opens on it.
+    ///
+    /// iroh clears the selected path when the last connection to that endpoint
+    /// closes, so this handle stays in the map after individual SSH streams end.
+    fn track_outbound(&self, conn: Connection) {
+        let endpoint_id = conn.remote_id();
+        {
+            let mut peers = self.peers.lock().expect("peers");
+            if peers
+                .get(&endpoint_id)
+                .is_some_and(|existing| existing.close_reason().is_none())
+            {
+                return;
+            }
+            peers.insert(endpoint_id, conn.clone());
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            this.serve_streams(conn).await;
+        });
+    }
+
+    async fn dial(&self, endpoint_id: EndpointId) -> anyhow::Result<Connection> {
+        let endpoint = self.inner.as_ref().expect("inner not set").endpoint.clone();
+        let mut addr = EndpointAddr::new(endpoint_id);
+        for url in &self.relay_urls {
+            addr = addr.with_relay_url(url.clone());
+        }
+        let conn = endpoint.connect(addr, &IrohSsh::ALPN()).await?;
+        self.track_outbound(conn.clone());
+        Ok(conn)
+    }
+
+    async fn peer_conn(&self, endpoint_id: EndpointId) -> anyhow::Result<Connection> {
+        if let Some(conn) = self.live(endpoint_id) {
+            return Ok(conn);
+        }
+        self.dial(endpoint_id).await
+    }
+
+    async fn open_bi_to(
+        &self,
+        endpoint_id: EndpointId,
+    ) -> anyhow::Result<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream)> {
+        let conn = self.peer_conn(endpoint_id).await?;
+        if let Ok(streams) = conn.open_bi().await {
+            return Ok(streams);
+        }
+        self.retire(endpoint_id);
+        let conn = self.dial(endpoint_id).await?;
+        conn.open_bi()
+            .await
+            .map_err(|err| anyhow::anyhow!("open stream: {err:#}"))
+    }
+
+    async fn serve_streams(self, connection: Connection) {
+        let endpoint_id = connection.remote_id();
+        loop {
+            if !self.allowed(&endpoint_id) {
+                eprintln!("rejected endpoint {endpoint_id}");
+                break;
+            }
+            match connection.accept_bi().await {
+                Ok((send, recv)) => {
+                    let ssh_port = self.ssh_port;
+                    tokio::spawn(async move {
+                        if let Err(err) = splice_sshd(ssh_port, send, recv).await {
+                            eprintln!("ssh stream from {endpoint_id}: {err:#}");
+                        }
+                    });
+                }
+                Err(err) => {
+                    eprintln!("connection from {endpoint_id} closed: {err:#}");
+                    break;
+                }
+            }
+        }
+        self.retire(endpoint_id);
+    }
+}
+
+pub(crate) fn ssh_dir(key_dir: Option<&Path>) -> anyhow::Result<std::path::PathBuf> {
+    if let Some(dir) = key_dir {
+        return Ok(dir.to_path_buf());
+    }
+    let home = my_home()?.ok_or_else(|| anyhow::anyhow!("home directory not found"))?;
+    Ok(home.join(".ssh"))
+}
+
+pub(crate) fn proxy_socket_path(key_dir: Option<&Path>) -> anyhow::Result<std::path::PathBuf> {
+    Ok(ssh_dir(key_dir)?.join("iroh-ssh.sock"))
+}
+
+#[cfg(unix)]
+impl IrohSsh {
+    pub fn spawn_proxy_listener(
+        &self,
+        key_dir: Option<&Path>,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        let path = proxy_socket_path(key_dir)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        let this = self.clone();
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let this = this.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = this.serve_proxy_client(stream).await {
+                                eprintln!("proxy client: {err:#}");
+                            }
+                        });
+                    }
+                    Err(err) => {
+                        eprintln!("proxy socket: {err}");
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(path)
+    }
+
+    async fn serve_proxy_client(&self, mut stream: tokio::net::UnixStream) -> anyhow::Result<()> {
+        let mut hdr = [0u8; 65];
+        stream.read_exact(&mut hdr).await?;
+        if hdr[64] != b'\n' {
+            bail!("proxy header is not an endpoint id");
+        }
+        let text = std::str::from_utf8(&hdr[..64])?;
+        let endpoint_id = EndpointId::from_str(text)?;
+        let (mut iroh_send, mut iroh_recv) = self.open_bi_to(endpoint_id).await?;
+        let (mut local_read, mut local_write) = stream.into_split();
+        let to_peer = async move {
+            let res = tokio::io::copy(&mut local_read, &mut iroh_send).await;
+            iroh_send.finish().ok();
+            res
+        };
+        let from_peer = async move { tokio::io::copy(&mut iroh_recv, &mut local_write).await };
+        let (to_peer, from_peer) = tokio::join!(to_peer, from_peer);
+        to_peer?;
+        from_peer?;
+        Ok(())
+    }
+}
+
+async fn splice_sshd(
+    ssh_port: u16,
+    mut iroh_send: iroh::endpoint::SendStream,
+    mut iroh_recv: iroh::endpoint::RecvStream,
+) -> anyhow::Result<()> {
+    let mut ssh_stream = TcpStream::connect(format!("127.0.0.1:{ssh_port}")).await?;
+    let (mut local_read, mut local_write) = ssh_stream.split();
+    let to_ssh = async move {
+        let res = tokio::io::copy(&mut iroh_recv, &mut local_write).await;
+        local_write.shutdown().await.ok();
+        res
+    };
+    let from_ssh = async move {
+        let res = tokio::io::copy(&mut local_read, &mut iroh_send).await;
+        iroh_send.finish().ok();
+        res
+    };
+    let (to_ssh, from_ssh) = tokio::join!(to_ssh, from_ssh);
+    to_ssh?;
+    from_ssh?;
+    Ok(())
+}
+
+pub(crate) async fn spawn_ssh(
+    target: String,
+    ssh_opts: SshOpts,
+    remote_cmd: Vec<OsString>,
+    relay_urls: &[String],
+    extra_relay_urls: &[String],
+) -> io::Result<Child> {
+    let c_exe = std::env::current_exe()?;
+    let mut cmd = build_ssh_command(
+        &c_exe,
+        target,
+        ssh_opts,
+        remote_cmd,
+        relay_urls,
+        extra_relay_urls,
+    );
+    cmd.stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
 }
 
 fn build_ssh_command(
@@ -322,40 +551,15 @@ fn build_ssh_command(
 impl ProtocolHandler for IrohSsh {
     async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
         let endpoint_id = connection.remote_id();
-
-        match connection.accept_bi().await {
-            Ok((mut iroh_send, mut iroh_recv)) => {
-                println!("Accepted bidirectional stream from {endpoint_id}");
-
-                match TcpStream::connect(format!("127.0.0.1:{}", self.ssh_port)).await {
-                    Ok(mut ssh_stream) => {
-                        println!("Connected to local SSH server on port {}", self.ssh_port);
-
-                        let (mut local_read, mut local_write) = ssh_stream.split();
-
-                        let a_to_b = async move {
-                            let res = tokio::io::copy(&mut local_read, &mut iroh_send).await;
-                            iroh_send.finish().ok();
-                            res
-                        };
-                        let b_to_a = async move {
-                            let res = tokio::io::copy(&mut iroh_recv, &mut local_write).await;
-                            local_write.shutdown().await.ok();
-                            res
-                        };
-
-                        let (_, _) = tokio::join!(a_to_b, b_to_a);
-                    }
-                    Err(e) => {
-                        println!("Failed to connect to SSH server: {e}");
-                    }
-                }
-            }
-            Err(e) => {
-                println!("Failed to accept bidirectional stream: {e}");
-            }
+        if !self.allowed(&endpoint_id) {
+            eprintln!("rejected endpoint {endpoint_id}");
+            return Ok(());
         }
-
+        {
+            let mut peers = self.peers.lock().expect("peers");
+            peers.insert(endpoint_id, connection.clone());
+        }
+        self.clone().serve_streams(connection).await;
         Ok(())
     }
 }
