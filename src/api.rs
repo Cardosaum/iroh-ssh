@@ -11,7 +11,16 @@ use crate::{
 
 fn parse_relay_urls(urls: &[String]) -> anyhow::Result<Vec<RelayUrl>> {
     urls.iter()
-        .map(|s| RelayUrl::from_str(s).map_err(|e| anyhow::anyhow!("invalid relay URL '{s}': {e}")))
+        .map(|s| {
+            let url = RelayUrl::from_str(s)
+                .map_err(|e| anyhow::anyhow!("invalid relay URL '{s}': {e}"))?;
+            // presets::N0 is what pulls in n0. Minimal does not. Refuse the hosts anyway.
+            let host = url.host_str().unwrap_or("").trim_end_matches('.');
+            if host == "n0.iroh.link" || host.ends_with(".n0.iroh.link") {
+                bail!("n0 relay {s} is not used");
+            }
+            Ok(url)
+        })
         .collect()
 }
 
@@ -280,4 +289,23 @@ pub(crate) fn abs_key_dir(key_dir: Option<PathBuf>) -> Option<PathBuf> {
             std::env::current_dir().unwrap_or_default().join(key_dir)
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_relay_urls;
+
+    #[test]
+    fn rejects_n0_relays() {
+        let err = parse_relay_urls(&["https://use1-1.relay.n0.iroh.link.".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("n0"), "{err}");
+        assert_eq!(
+            parse_relay_urls(&["https://relay.example".into()])
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 }
