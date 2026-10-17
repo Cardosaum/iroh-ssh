@@ -230,12 +230,49 @@ fn live(peers: &HashMap<EndpointId, Connection>, id: EndpointId) -> Option<Conne
 }
 
 fn allowed(endpoint_id: &EndpointId) -> bool {
-    let Ok(allow) = std::env::var("IROH_SSH_ALLOW") else {
-        return true;
+    let Some(allow) = current_allow() else {
+        eprintln!("no iroh allow list; refusing {endpoint_id}");
+        return false;
     };
-    allow
-        .split(',')
-        .any(|id| id.trim() == endpoint_id.to_string())
+    allow_list_has(&allow, &endpoint_id.to_string())
+}
+
+/// `iroh-allow` next to the server key overrides `IROH_SSH_ALLOW`.
+/// The helium launchd job does not set that variable, and hydrogen's
+/// shepherd value changes only on reconfigure.
+fn current_allow() -> Option<String> {
+    if let Ok(dir) = ssh_dir(None) {
+        if let Ok(text) = std::fs::read_to_string(dir.join("iroh-allow")) {
+            let text = text.trim();
+            if !text.is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+    std::env::var("IROH_SSH_ALLOW")
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+fn allow_list_has(allow: &str, endpoint_id: &str) -> bool {
+    allow.split(',').any(|id| id.trim() == endpoint_id)
+}
+
+fn key_dir_mode(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+fn private_key_mode(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
 }
 
 pub(crate) fn ssh_dir(key_dir: Option<&Path>) -> anyhow::Result<std::path::PathBuf> {
@@ -547,6 +584,7 @@ pub fn dot_ssh(
 
     let pub_key = ssh_dir.join("irohssh_ed25519.pub");
     let priv_key = ssh_dir.join("irohssh_ed25519");
+    key_dir_mode(&ssh_dir);
 
     tracing::debug!("dot_ssh: ssh_dir exists = {}", ssh_dir.exists());
     tracing::debug!("dot_ssh: pub_key path = {}", pub_key.display());
@@ -579,6 +617,7 @@ pub fn dot_ssh(
                 tracing::info!("dot_ssh: Keys exist, reading them");
                 // read secret key
                 if let Ok(secret_key) = std::fs::read(priv_key.clone()) {
+                    private_key_mode(&priv_key);
                     let mut sk_bytes = [0u8; SECRET_KEY_LENGTH];
                     sk_bytes.copy_from_slice(z32::decode(secret_key.as_slice())?.as_slice());
                     Ok(SecretKey::from_bytes(&sk_bytes))
@@ -609,6 +648,7 @@ pub fn dot_ssh(
 
                 match std::fs::write(&priv_key, z32::encode(&secret_key.to_bytes())) {
                     Ok(_) => {
+                        private_key_mode(&priv_key);
                         tracing::info!("dot_ssh: Successfully wrote priv_key");
                     }
                     Err(e) => {
@@ -629,6 +669,7 @@ pub fn dot_ssh(
             if pub_key.exists() && priv_key.exists() {
                 // read secret key
                 if let Ok(secret_key) = std::fs::read(priv_key.clone()) {
+                    private_key_mode(&priv_key);
                     let mut sk_bytes = [0u8; SECRET_KEY_LENGTH];
                     sk_bytes.copy_from_slice(z32::decode(secret_key.as_slice())?.as_slice());
                     return Ok(SecretKey::from_bytes(&sk_bytes));
@@ -652,6 +693,13 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn empty_allow_list_refuses_peers() {
+        assert!(!allow_list_has("", "abc"));
+        assert!(allow_list_has("abc, def", "def"));
+        assert!(!allow_list_has("abc", "def"));
     }
 
     #[test]

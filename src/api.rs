@@ -16,6 +16,9 @@ fn parse_relay_urls(urls: &[String]) -> anyhow::Result<Vec<RelayUrl>> {
                 .map_err(|e| anyhow::anyhow!("invalid relay URL '{s}': {e}"))?;
             // presets::N0 is what pulls in n0. Minimal does not. Refuse the hosts anyway.
             let host = url.host_str().unwrap_or("").trim_end_matches('.');
+            if host.parse::<std::net::IpAddr>().is_ok() {
+                bail!("relay {s} must be a hostname");
+            }
             if host == "n0.iroh.link" || host.ends_with(".n0.iroh.link") {
                 bail!("n0 relay {s} is not used");
             }
@@ -301,6 +304,8 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("n0"), "{err}");
+        let ip = parse_relay_urls(&["https://203.0.113.5".into()]).unwrap_err();
+        assert!(ip.to_string().contains("hostname"), "{ip}");
         assert_eq!(
             parse_relay_urls(&["https://relay.example".into()])
                 .unwrap()
